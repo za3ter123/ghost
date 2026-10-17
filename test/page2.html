@@ -1,0 +1,8 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Page Two</title></head>
+<body><p>second page</p>
+<input aria-label="Search box">
+<button onclick="setTimeout(function () { var b = document.createElement('button'); b.textContent = 'Late one'; b.onclick = function () { document.getElementById('s').textContent = 'late clicked'; }; document.body.appendChild(b); }, 700)">Later</button>
+<p id="s">idle</p>
+<a href="web.html">Back home</a>
+</body></html>

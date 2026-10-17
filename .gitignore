@@ -1,0 +1,10 @@
+target/
+legacy/
+*.exe
+*.png
+.ruff_cache/
+bench/playwright-mcp.json
+GATES.md
+bench/results.jsonl
+*.log
+*.tmp
