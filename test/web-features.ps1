@@ -164,7 +164,7 @@ else {
 #   user's is in front (0, the taskbar, the sink). Otherwise it says so, as information: the live run is a
 #   separate manual gate; the decision above is this gate's check.
 $pl = Join-Path $script:fgwDir 'planted.log'
-Set-Content $pl @('1.0 P 0 - V 0 O - 1000', '2.0 E 1769932 Chrome_WidgetWin_1 V 20984 O - 1100', '3.0 E 555 ghost-sink P 1 O - 3100', '4.0 END 3200')
+Set-Content $pl @('1.0 P 0 - V 0 O - 1000', '2.0 E 111111 Chrome_WidgetWin_1 V 2222 O - 1100', '3.0 E 555 ghost-sink P 1 O - 3100', '4.0 END 3200')
 if (@(Read-FgLog $pl).Count -lt 2) { Fail 'the watcher let a window other than the sink hold the foreground at foreground 0' }
 $r = G launch msedge $u1
 $w9 = if ($r.Out -match '^(\d+) ') { $Matches[1] } else { '' }

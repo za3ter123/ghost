@@ -1,5 +1,7 @@
 # Prints the tool calls (and trimmed results) one benchmark run makes, to see where turns go.
 #   trace.ps1 -Tool ghost -Task W1
+# The W1 page comes from $env:GHOST_TRACE_WEB if set (a file:// URL to test/web.html works for ghost and agent-browser);
+# the default, http://127.0.0.1:8765/web.html, needs a local http server serving test/.
 param([string]$Tool = 'ghost', [string]$Task = 'W1', [string]$Model = 'haiku')
 $ErrorActionPreference = 'Continue'
 $root = $PSScriptRoot

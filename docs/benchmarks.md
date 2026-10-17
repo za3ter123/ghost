@@ -115,7 +115,22 @@ These untagged rows were measured with earlier ghost versions. They are kept bec
 | N2 | ghost | 3/3 | 148892 | 7 | 20.7 s | n/a |
 | N2 | no tool | 3/3 | 66206 | 3 | 22.1 s | n/a |
 
-The rows tagged `gate-20261017-144352` are an earlier gate run of this round and are not in any table here. They stay in the data file.
+The rows tagged `gate-20261017-144352` are an earlier gate run of this round. It ran on the build before bare `read` and the always-run final `close` in `run`, so it measures an older ghost and is left out of the current numbers. Its table shows what those two changes did on A1, N1 and N2.
+
+### Gate run gate-20261017-144352
+
+| Task | Tool | Correct | Median total tokens | Median turns | Median wall time | Median tool tokens |
+|---|---|---|---|---|---|---|
+| W1 | ghost | 3/3 | 40134 | 2 | 9.7 s | 138 |
+| W1 | agent-browser | 3/3 | 80586 | 4 | 12.3 s | 213 |
+| W2 | ghost | 3/3 | 40703 | 2 | 10.7 s | 783 |
+| W2 | agent-browser | 3/3 | 79749 | 4 | 12.9 s | 140 |
+| A1 | ghost | 3/3 | 103072 | 5 | 14.4 s | 312 |
+| A1 | no tool | 3/3 | 129979 | 5 | 40.7 s | 3204 |
+| N1 | ghost | 3/3 | 107207 | 5 | 14.5 s | 1468 |
+| N1 | no tool | 2/3 | 62780 | 3 | 16.4 s | 536 |
+| N2 | ghost | 3/3 | 60874 | 3 | 11.6 s | 180 |
+| N2 | no tool | 3/3 | 69204 | 3 | 23.8 s | 1300 |
 
 ## Limits
 
@@ -125,7 +140,7 @@ The rows tagged `gate-20261017-144352` are an earlier gate run of this round and
 - Correct means the reply contains the expected text. It does not check how the agent got there: in one N1 run without a tool, Haiku could not open the Explorer window, listed the folder from the file system instead, and still counts as correct.
 - 3 runs per round, 6 for the current pairs that ran in both gate runs, is a small sample. The two gate runs differ noticeably on some pairs; compare their tables above.
 - Everything ran on one Windows 11 PC with one model.
-- The live check that ghost leaves the foreground alone when the user has no window in front (`FG0 live` in `test/web-features.ps1`) has not been run yet.
+- The live check that ghost leaves the foreground alone when the user has no window in front (`FG0 live` in `test/web-features.ps1`) has not been run yet. Only the guard's decision for that case is tested, through `ghost debug-fg0`.
 
 ## Reproduce
 

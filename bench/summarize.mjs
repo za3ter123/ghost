@@ -35,6 +35,8 @@ const TOOLS = ['ghost', 'agent-browser', 'playwright', 'chrome', 'none'];
 const NAME = { ghost: 'ghost', 'agent-browser': 'agent-browser', playwright: 'Playwright MCP', chrome: 'Claude in Chrome', none: 'no tool' };
 const current = rows.filter((r) => CURRENT.includes(r.tag));
 const before = rows.filter((r) => !r.tag);
+// Ran on the build before bare `read` and the always-run final `close`, so it measures an older ghost.
+const OLDER_GATE = 'gate-20261017-144352';
 
 const k = (n) => (n == null ? 'n/a' : `${(n / 1000).toFixed(1)}k`);
 const int = (n) => (n == null ? 'n/a' : String(Math.round(n)));
@@ -76,9 +78,10 @@ console.log('');
 detail('Current round, both gate runs and the Claude in Chrome run together', current);
 for (const tag of CURRENT.slice(0, 2)) detail(`Gate run ${tag} on its own`, rows.filter((r) => r.tag === tag));
 detail('Before this round (untagged rows, earlier ghost versions)', before);
+detail(`Gate run ${OLDER_GATE} (the build before bare read and close-always)`, rows.filter((r) => r.tag === OLDER_GATE));
 
 const per = rows.filter((r) => r.turns > 0 && r.total > 0).map((r) => r.total / r.turns);
 console.log('### Context per turn, all rows\n');
 console.log(`Rows: ${per.length}. Total tokens divided by turns: lowest ${int(Math.min(...per))}, median ${int(median(per))}.`);
-const skipped = [...new Set(rows.filter((r) => r.tag && !CURRENT.includes(r.tag)).map((r) => r.tag))];
+const skipped = [...new Set(rows.filter((r) => r.tag && r.tag !== OLDER_GATE && !CURRENT.includes(r.tag)).map((r) => r.tag))];
 if (skipped.length) console.log(`\nTagged rows not shown above: ${skipped.join(', ')}.`);

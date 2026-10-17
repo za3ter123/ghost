@@ -61,7 +61,7 @@ VERIFIED.** `tests/chrome_a11y.cs`, my own throwaway msedge + temp profile (neve
   a browser ghost launches itself, add the three anti-throttling flags + optionally
   `--force-renderer-accessibility`. For an already-open browser, the first `tree` will be
   chrome-only; re-run after ~1–2 s, or cache and poll until Document gets children.
-- Note: `ghost.exe tree <opera hwnd>` on the live Opera returned "UIA could not read window:
+- Note: `ghost.exe tree <hwnd>` on a live browser window returned "UIA could not read window:
   Unrecognized error" (ElementFromHandle on that top-level failed) — worth a look, but the DOM-wake
   timing above is the substantive answer.
 
