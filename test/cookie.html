@@ -1,0 +1,10 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>ghost cookie fixture</title></head>
+<body>
+<p id="c">no cookie yet</p>
+<script>
+// First visit (?set=1) sets the cookie; every visit shows what the browser sends back.
+if (location.search.indexOf('set=1') >= 0) document.cookie = 'ghostsession=kept42; path=/; max-age=3600';
+document.getElementById('c').textContent = 'cookie: ' + (document.cookie || 'none');
+</script>
+</body></html>

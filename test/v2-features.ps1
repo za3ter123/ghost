@@ -1,4 +1,5 @@
-# ghost v2 feature checks on the throwaway fixture: stable refs, diff after action, batch, wait, OCR click.
+# ghost v2 feature checks on the throwaway fixture: stable refs, diff after action, batch, wait, OCR click,
+# bare read, run step validation and finally-close, and modifier combos being refused.
 $ErrorActionPreference = 'Continue'
 $g = Join-Path $PSScriptRoot '..\ghost.exe'
 $fx = Join-Path $env:TEMP 'ghost-fixture.exe'
@@ -169,6 +170,16 @@ $r = G run "launch $fx v2-final" 'click No such button' 'close'
 $hf = [regex]::Match($r.Out, '^(\d+) ').Groups[1].Value
 if ($r.Code -ne 1 -or $r.Out -notmatch 'step 2: ' -or $r.Out -notmatch '(?m)^3 closed?$') { Fail "a last close did not run after a failed step: $($r.Out)" }
 if ($hf -and ((G windows).Out -match "(?m)^$hf ")) { Fail 'the failed run left its window open'; G close $hf | Out-Null }
+
+# 6. Modifier combos are refused (they would need another thread's keyboard state), and nothing is sent.
+$h = Launch 'v2-combo'
+G type $h Body 'hello' | Out-Null
+foreach ($c in 'ctrl+a', 'shift+tab') {
+  $r = G key $h Body $c
+  if ($r.Code -ne 1 -or $r.Out -notmatch 'background unavailable') { Fail "$c was not refused: $($r.Out)" }
+}
+if ((G read $h Body).Out -ne 'hello') { Fail 'a refused combo changed the text' }
+G close $h | Out-Null
 
 $fgw = @(Stop-FgWatch); $fgw[0]; $fgw | Select-Object -Skip 1 | ForEach-Object { Fail $_ }
 if ($fails.Count -eq 0) { 'V2 PASS'; exit 0 } else { "V2 FAIL ($($fails.Count))"; exit 1 }

@@ -3,7 +3,7 @@ $root = $PSScriptRoot
 $exe = Join-Path $root 'ghost.exe'
 
 # Static CRT and delay-loaded GUI/COM DLLs: the client path then loads only kernel32 and ntdll (about 1 ms per call).
-$delay = 'user32', 'oleaut32', 'combase', 'ole32', 'dwmapi', 'winmm', 'advapi32', 'gdi32', 'api-ms-win-core-winrt-l1-1-0', 'shell32', 'shlwapi' | ForEach-Object { "-C link-arg=/DELAYLOAD:$_.dll" }
+$delay = 'user32', 'oleaut32', 'combase', 'ole32', 'dwmapi', 'winmm', 'advapi32', 'gdi32', 'api-ms-win-core-winrt-l1-1-0', 'shell32', 'shlwapi', 'ws2_32' | ForEach-Object { "-C link-arg=/DELAYLOAD:$_.dll" }
 $env:RUSTFLAGS = ((@('-C target-feature=+crt-static') + $delay + '-C link-arg=delayimp.lib') -join ' ')
 Push-Location $root
 try { $log = & cargo build --release --locked 2>&1 | Out-String; $code = $LASTEXITCODE } finally { Pop-Location }

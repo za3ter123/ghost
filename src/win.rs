@@ -259,7 +259,8 @@ pub fn close(h: HWND) {
     if let Some(s) = saved_rect(h) {
         // Un-park behind every window first, so apps that remember their position don't reopen off screen.
         unsafe {
-            let _ = SetWindowPos(h, Some(HWND_BOTTOM), s.left, s.top, s.right - s.left, s.bottom - s.top, SWP_NOACTIVATE);
+            // Async: a synchronous SetWindowPos waits on a busy app's UI thread (a browser under load).
+            let _ = SetWindowPos(h, Some(HWND_BOTTOM), s.left, s.top, s.right - s.left, s.bottom - s.top, SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
         }
     }
     unsafe {
@@ -268,16 +269,34 @@ pub fn close(h: HWND) {
     let _ = std::fs::remove_file(park_file(h));
 }
 
-/// Where the foreground goes back to after an app took it: the user's window `prev`, or, when there was none
-/// (foreground 0), it is gone, or it is the taskbar, ghost's sink, a hidden window that swallows every key, so
-/// keystrokes go nowhere, as they did at foreground 0. The taskbar only when there is no sink.
-pub fn handback(prev: HWND) -> HWND {
+/// A window that can take the foreground back: it exists and is not ghost's (not a launched or parked window, not
+/// any window of a process ghost launched). Shared by handback and restore_foreground's step-down.
+fn owners(h: HWND) -> bool {
+    is_window(h) && !crate::engine::ghost_window(h) && !crate::engine::ghost_pid(app_pid(h))
+}
+
+/// Where the foreground goes back to after an app took it: the `prior` foreground if it still exists, else the
+/// owner's `last_user` visible window. Only when there was none (prior 0 or the taskbar, or both gone) ghost's
+/// sink, a hidden window that swallows every key, so keystrokes go nowhere, as they did at foreground 0. The
+/// taskbar only when there is no sink.
+pub fn handback(prior: HWND, last_user: HWND) -> HWND {
     let sink = hwnd(SINK.load(std::sync::atomic::Ordering::SeqCst));
-    if is_window(prev) && user_window(prev) && !crate::engine::ghost_window(prev) && class_of(prev) != "Shell_TrayWnd" {
-        return prev;
+    let theirs = owners;
+    // The taskbar in front is how Windows shows "no window" (desktop click, natural fg 0): treated as prior 0.
+    if !prior.0.is_null() && class_of(prior) != "Shell_TrayWnd" {
+        // Still there: that exact window, even hidden or transient (Task View, ForegroundStaging). It is what the
+        // owner had, and the sink in its place swallowed their keys (round 10: 19 of 31 sink handbacks were these).
+        if theirs(prior) {
+            return prior;
+        }
+        // Gone: the owner's last visible window, which the hook tracks.
+        if theirs(last_user) && user_window(last_user) {
+            crate::daemon::dbg(&format!("handback: prior {} gone, last user window {}", hv(prior), hv(last_user)));
+            return last_user;
+        }
     }
     if is_window(sink) {
-        crate::daemon::dbg(&format!("handback: sink, prev {} (window {}, user {}, class {})", hv(prev), is_window(prev), user_window(prev), class_of(prev)));
+        crate::daemon::dbg(&format!("handback: sink, prior {} (window {}, class {}), last user {}", hv(prior), is_window(prior), class_of(prior), hv(last_user)));
         return sink;
     }
     taskbar()
@@ -319,8 +338,96 @@ pub fn user_window(h: HWND) -> bool {
     visible(h) && class_of(h) != "ForegroundStaging"
 }
 
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetModuleHandleW(name: *const u16) -> isize;
+    fn GetProcAddress(module: isize, name: *const u8) -> isize;
+}
+/// user32's HungWindowFromGhostWindow: exported but not in the import library, so looked up at run time.
+unsafe fn hung_from_ghost(h: HWND) -> HWND {
+    let m = GetModuleHandleW(wide("user32.dll").as_ptr());
+    let f = if m == 0 { 0 } else { GetProcAddress(m, b"HungWindowFromGhostWindow\0".as_ptr()) };
+    if f == 0 {
+        return HWND::default();
+    }
+    let f: extern "system" fn(HWND) -> HWND = std::mem::transmute(f);
+    f(h)
+}
+/// The owner's window to remember for `h`. When an app hangs, DWM puts its own stand-in (class "Ghost") in front,
+/// and destroys it once the app answers again; remembering the stand-in made the handback fall to the sink while
+/// the owner's hung app was still in front (measured 2026-10-17, a hung desktop app). The hung app's real window is kept.
+pub fn owner_window(h: HWND) -> HWND {
+    // HungWindowFromGhostWindow answers null for any window that isn't DWM's stand-in.
+    if class_of(h) == "Ghost" {
+        let real = unsafe { hung_from_ghost(h) };
+        if is_window(real) {
+            return real;
+        }
+    }
+    h
+}
+
 /// `cur` is the app window that took the foreground; give it back to `prev`.
+/// Gives the foreground back to `prev`, and checks it took: a window that exists can still refuse it (explorer's
+/// ForegroundStaging did, and the owner was left on it for 2.7 s, budget N2 2026-10-17). Not there within ~30 ms,
+/// it steps down to the owner's last visible window, then the sink. Stops if someone else took the foreground.
 pub fn restore_foreground(prev: HWND, cur: HWND) {
+    let sink = hwnd(SINK.load(std::sync::atomic::Ordering::SeqCst));
+    let last = hwnd(crate::daemon::last_user());
+    let steps = steps(prev, last, sink, |h| owners(h) && user_window(h));
+    let got = first_taken(&steps, |t| {
+        // From whatever of ghost's is in front now: another window of the same app may have taken over from `cur`
+        // (budget N2, 2026-10-18: a Calculator frame held it while the guard kept restoring from an Explorer window).
+        let f = unsafe { GetForegroundWindow() };
+        restore_once(t, if !f.0.is_null() && is_window(f) && !owners(f) { f } else { cur });
+        let start = std::time::Instant::now();
+        loop {
+            let f = unsafe { GetForegroundWindow() };
+            if f == t {
+                return Some(true);
+            }
+            if !f.0.is_null() && f != cur && owners(f) {
+                return None; // the owner (or another app) moved on: ghost's steal is over, never fight it
+            }
+            if start.elapsed() >= std::time::Duration::from_millis(30) {
+                return Some(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    });
+    if got != Some(prev) {
+        crate::daemon::dbg(&format!("restore: {} refused; {}", hv(prev), got.map(|g| format!("gave it to {}", hv(g))).unwrap_or("stopped".into())));
+    }
+}
+
+/// The hand-back order: `to`, then the last user window (when it is one), then the sink; each once. To the sink
+/// means there was no window, so nothing comes before it.
+fn steps(to: HWND, last: HWND, sink: HWND, usable: impl Fn(HWND) -> bool) -> Vec<HWND> {
+    let mut v = vec![to];
+    if to != sink {
+        if last != to && usable(last) {
+            v.push(last);
+        }
+        if !sink.0.is_null() {
+            v.push(sink);
+        }
+    }
+    v
+}
+
+/// The first step `attempt` reports taken (Some(true)); Some(false) tries the next, None stops.
+fn first_taken(steps: &[HWND], mut attempt: impl FnMut(HWND) -> Option<bool>) -> Option<HWND> {
+    for &t in steps {
+        match attempt(t) {
+            Some(true) => return Some(t),
+            Some(false) => continue,
+            None => return None,
+        }
+    }
+    None
+}
+
+fn restore_once(prev: HWND, cur: HWND) {
     unsafe {
         let t = thread_of(cur);
         let me = GetCurrentThreadId();
@@ -337,7 +444,7 @@ pub fn restore_foreground(prev: HWND, cur: HWND) {
             r
         });
         let root = root_of(cur);
-        let ours = crate::engine::ghost_window(root);
+        let ours = is_window(root) && !owners(root); // same rule as handback: launched, parked, or a launched pid
         if ours {
             sink(root);
         }
@@ -370,6 +477,26 @@ pub fn restore_foreground(prev: HWND, cur: HWND) {
     }
 }
 
+
+#[cfg(test)]
+mod cascade_tests {
+    use super::*;
+    #[test]
+    fn refused_prior_steps_down_to_last_user_then_sink() {
+        let (prior, last, sink) = (hwnd(11), hwnd(22), hwnd(33));
+        let st = steps(prior, last, sink, |_| true);
+        assert_eq!(st, vec![prior, last, sink]);
+        // prior exists but refuses the foreground: the owner's last window gets it
+        assert_eq!(first_taken(&st, |t| Some(t != prior)), Some(last));
+        // both refuse: the sink
+        assert_eq!(first_taken(&st, |t| Some(t == sink)), Some(sink));
+        // someone else took the foreground meanwhile: stop at once
+        assert_eq!(first_taken(&st, |_| None), None);
+        // no usable last window: straight to the sink; a sink target has no step before or after it
+        assert_eq!(steps(prior, last, sink, |_| false), vec![prior, sink]);
+        assert_eq!(steps(sink, last, sink, |_| true), vec![sink]);
+    }
+}
 
 pub fn screen_to_client(h: HWND, p: POINT) -> POINT {
     let mut q = p;

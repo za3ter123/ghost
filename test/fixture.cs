@@ -10,8 +10,7 @@ class Fixture {
         f.Text = args.Length > 0 ? args[0] : "ghost-fixture";
         f.Width = 420; f.Height = 300;
         var box = new TextBox();
-        box.Multiline = true; box.AccessibleName = "Body"; box.Left = 10; box.Top = 10; box.Width = 380; box.Height = 120;
-        var status = new Label();
+        box.Multiline = true; box.AccessibleName = "Body"; box.Left = 10; box.Top = 10; box.Width = 380; box.Height = 120;        var status = new Label();
         status.Text = "idle"; status.Left = 10; status.Top = 210; status.Width = 380;
         var btn = new Button();
         btn.Text = "Settings"; btn.Left = 10; btn.Top = 140; btn.Width = 100;

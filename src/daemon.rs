@@ -16,7 +16,7 @@ use windows::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStr
 use windows::Win32::Security::{GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER};
 use windows::Win32::Storage::FileSystem::{FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
 use windows::Win32::System::Pipes::*;
-use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, GetCurrentThreadId, OpenProcessToken};
+use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, GetCurrentThread, GetCurrentThreadId, OpenProcessToken, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -31,11 +31,17 @@ pub fn request_stop() {
     STOP.store(true, Ordering::SeqCst);
 }
 
+/// The debug log: GHOST_DEBUG, else the path in %LOCALAPPDATA%\ghost\debug.txt, read once per daemon (so it
+/// survives build.ps1's restart). The file only turns on this log; the `ok <path>` output lines stay GHOST_DEBUG's.
+static DEBUG_LOG: LazyLock<Option<String>> = LazyLock::new(|| {
+    std::env::var("GHOST_DEBUG").ok().or_else(|| std::fs::read_to_string(win::state_dir().join("debug.txt")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+});
+
 pub fn dbg(m: &str) {
-    if let Ok(f) = std::env::var("GHOST_DEBUG") {
+    if let Some(f) = DEBUG_LOG.as_deref() {
         use std::io::Write;
         if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(f) {
-            let _ = writeln!(fh, "{} {}", now_ms(), m);
+            let _ = writeln!(fh, "{} t{} {}", now_ms(), unsafe { windows::Win32::System::SystemInformation::GetTickCount() }, m);
         }
     }
 }
@@ -43,7 +49,8 @@ pub fn dbg(m: &str) {
 // ---------- event pump ----------
 #[derive(Default)]
 pub struct Fg {
-    pub user_fg: isize,
+    pub prior_fg: isize, // the last foreground not ghost's, any window (hidden, Task View); 0 = none
+    pub user_fg: isize,  // the last of those that was a visible user window
     pub act_until: HashMap<u32, u64>, // pid -> guard deadline
     hook_pid: HashMap<isize, u32>,
     pub pid_hooks: HashMap<u32, [isize; 2]>,
@@ -64,6 +71,10 @@ fn start_pump() {
     std::thread::spawn(move || unsafe {
         let mut m = MSG::default();
         let _ = PeekMessageW(&mut m, None, 0, 0, PM_NOREMOVE); // create the queue
+        // The foreground guard runs on this thread's WinEvent callback. Time-critical priority so it reclaims the
+        // foreground within a tick even when other processes saturate the CPU (measured: at ~90% load the guard
+        // otherwise took up to ~110 ms, a visible flash).
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         PUMP_TID.store(GetCurrentThreadId(), Ordering::SeqCst);
         win::create_sink();
         SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(on_foreground), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
@@ -83,8 +94,15 @@ fn start_pump() {
     });
     let _ = rx.recv();
     let f = unsafe { GetForegroundWindow() };
+    note_owner(&mut fg(), f);
+}
+
+/// Remember `f`, a foreground that is not ghost's, as the prior and, when visible, as the last user window.
+fn note_owner(g: &mut Fg, f: HWND) {
+    let o = hv(win::owner_window(f));
+    g.prior_fg = o;
     if win::user_window(f) {
-        fg().user_fg = hv(f);
+        g.user_fg = o;
     }
 }
 
@@ -165,7 +183,7 @@ unsafe extern "system" fn on_foreground(_hook: HWINEVENTHOOK, _e: u32, h: HWND, 
     if let Some(user) = guard_target(h) {
         win::restore_foreground(user, h);
         let tick = windows::Win32::System::SystemInformation::GetTickCount();
-        dbg(&format!("fg guard: {} (pid {}) -> {} reacted in {} ms", hv(h), p, hv(user), tick.wrapping_sub(time)));
+        dbg(&format!("fg guard: {} (pid {}) -> {} reacted in {} ms, event t{time}, now in front {}", hv(h), p, hv(user), tick.wrapping_sub(time), hv(GetForegroundWindow())));
     }
 }
 
@@ -177,16 +195,29 @@ fn guard_target(h: HWND) -> Option<HWND> {
     let acting = g.act_until.get(&p).map(|&u| now < u).unwrap_or(false);
     // A ghost window holding the foreground is never right, whenever it happens: nobody can see it.
     let ours = acting || crate::engine::ghost_window(h) || crate::engine::pending_launch(p);
-    if !ours && win::user_window(h) {
-        g.user_fg = hv(h); // the user's own switch: remember it, never fight it
+    if !ours {
+        note_owner(&mut g, h); // the user's own switch: remember it, never fight it
     }
     let user = give_back(&g);
     (ours && user != h && !user.0.is_null()).then_some(user)
 }
 
-/// Where the foreground goes back to: the user's last window, else (none, gone, the taskbar) win::handback's.
+/// Where the foreground goes back to: win::handback's choice from the prior and the last user window.
 fn give_back(g: &Fg) -> HWND {
-    win::handback(if FAKE_FG0.load(Ordering::SeqCst) { HWND::default() } else { hwnd(g.user_fg) })
+    if FAKE_FG0.load(Ordering::SeqCst) {
+        return win::handback(HWND::default(), HWND::default());
+    }
+    win::handback(hwnd(g.prior_fg), hwnd(g.user_fg))
+}
+
+/// The owner's last visible window, for win::restore_foreground's step-down.
+pub fn last_user() -> isize {
+    fg().user_fg
+}
+
+/// win::handback for a prior foreground the caller read itself (launch, go).
+pub fn handback_from(prior: HWND) -> HWND {
+    win::handback(prior, hwnd(fg().user_fg))
 }
 
 static FAKE_FG0: AtomicBool = AtomicBool::new(false);
@@ -218,6 +249,7 @@ struct FgLock {
     since: u64,
     until: u64,
     rest_until: u64,
+    last: String, // the last LockSetForegroundWindow(LSFW_LOCK) outcome, for `go`'s debug line
 }
 static FG_LOCK: LazyLock<Mutex<FgLock>> = LazyLock::new(Default::default);
 const LOCK_MAX_MS: u64 = 2000;
@@ -234,6 +266,7 @@ fn lock_fg() {
         }
         // Fails harmlessly when the user is active (then nothing can take the foreground anyway).
         let r = unsafe { LockSetForegroundWindow(LSFW_LOCK) };
+        l.last = if r.is_ok() { "ok".into() } else { format!("failed, GetLastError {}", unsafe { GetLastError().0 }) };
         dbg(&format!("fg lock: {}", if r.is_ok() { "taken".into() } else { format!("{r:?}") }));
         if r.is_err() {
             return; // not held: the next action tries again
@@ -241,6 +274,17 @@ fn lock_fg() {
         (l.held, l.since) = (true, now);
     }
     l.until = now + 1500;
+}
+/// Whether ghost holds the foreground lock now (it can only while the owner is idle).
+pub fn lock_held() -> bool {
+    FG_LOCK.lock().unwrap_or_else(|e| e.into_inner()).held
+}
+
+/// The foreground lock right now, for debug lines.
+pub fn lock_state() -> String {
+    let l = FG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let now = now_ms();
+    format!("lock held {} ({} ms), last LockSetForegroundWindow {}", l.held, if l.held { now - l.since } else { 0 }, if l.last.is_empty() { "never called" } else { &l.last })
 }
 fn release(l: &mut FgLock, now: u64) {
     unsafe {
@@ -287,11 +331,15 @@ pub fn mark_act(pid: u32) {
     g.act_until.retain(|_, &mut u| u >= now);
     let f = unsafe { GetForegroundWindow() };
     if f.0.is_null() {
-        if !busy {
+        // A transient foreground 0 (a window closing, a navigation) must not wipe a still-valid owner, or every
+        // later handback would go to the sink and the owner would never get the foreground back. Only forget the
+        // owner when its window is truly gone; give_back then falls to the sink on its own.
+        if !busy && !win::user_window(hwnd(g.user_fg)) {
             g.user_fg = 0;
-        } // no window had the foreground: give_back picks one (win::handback)
-    } else if !g.act_until.contains_key(&win::pid(f)) && !crate::engine::ghost_window(f) && win::user_window(f) {
-        g.user_fg = hv(f);
+            g.prior_fg = 0;
+        }
+    } else if !g.act_until.contains_key(&win::pid(f)) && !crate::engine::ghost_window(f) {
+        note_owner(&mut g, f);
     }
 }
 

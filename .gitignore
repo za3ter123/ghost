@@ -8,3 +8,4 @@ GATES.md
 bench/results.jsonl
 *.log
 *.tmp
+test/out/

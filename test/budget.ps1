@@ -16,7 +16,8 @@ Add-Type 'using System; using System.Runtime.InteropServices; public static clas
 function Parked($h) { $rc = New-Object BR+RC; [BR]::GetWindowRect($h, [ref]$rc) | Out-Null; $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen; -not (($rc.L -lt $vs.Right) -and ($rc.R -gt $vs.Left) -and ($rc.T -lt $vs.Bottom) -and ($rc.B -gt $vs.Top)) }
 # With no window in front (0, or the taskbar) ghost hands the foreground to the user's topmost window by design.
 $none = ($fg0 -eq [IntPtr]::Zero) -or ($fg0 -eq [BG]::FindWindow('Shell_TrayWnd', $null))
-function FgOk { $f = [BG]::GetForegroundWindow(); ($f -eq $fg0) -or ($none -and ($f -eq [IntPtr]::Zero -or -not (Parked $f))) }
+# The owner may switch windows during the run; only a ghost-started window in front (not its sink) is a steal.
+function FgOk { -not (Test-GhostForeground) }
 $online = $true
 try { Invoke-WebRequest -UseBasicParsing -Method Head -Uri 'https://example.com' -TimeoutSec 8 | Out-Null } catch { $online = $false }
 $env:GHOST_SESSION = 'budget-' + $PID
@@ -57,9 +58,11 @@ if ($code -ne 2 -or $out -notmatch 'step 4: usage: go') { $fails.Add("N2 with a 
 Start-Sleep -Milliseconds 1500
 if (@(Get-Process CalculatorApp -ErrorAction SilentlyContinue).Count -gt $before) { $fails.Add('N2 with a bad step launched Calculator anyway') }
 $out = (& $g run 'launch explorer.exe C:\Windows\Web' 'click No such item' 'close' 2>&1 | Out-String).Trim(); $code = $LASTEXITCODE
-$h = [regex]::Match($out, '^(\d+) ').Groups[1].Value
+$h = [regex]::Match($out, '(?m)^(\d+) \d+ explorer').Groups[1].Value
 'N1 finally exit {0}  {1}' -f $code, ($out -replace "`r?`n", ' | ')
-if ($code -ne 1 -or $out -notmatch '(?m)^3 closed?$') { $fails.Add("N1 with a failed step did not close its window: $out") }
+# 2>&1 merges ghost's stdout and stderr in arrival order, so `3 closed` can come after the error record's
+# formatted lines (seen 2026-10-18, about 1 run in 10): any line, surrounding spaces allowed.
+if ($code -ne 1 -or $out -notmatch '(?m)^\s*3 closed\s*$') { $fails.Add("N1 with a failed step did not close its window: $out") }
 if ($h -and [BG]::IsWindow([IntPtr][int64]$h)) { $fails.Add("N1 with a failed step left its window $h open"); & $g close $h | Out-Null }
 if (-not (FgOk)) { $fails.Add('the run-rule checks changed the foreground window') }
 $fgw = @(Stop-FgWatch); $fgw[0]; $fgw | Select-Object -Skip 1 | ForEach-Object { $fails.Add($_) }

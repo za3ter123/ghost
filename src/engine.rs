@@ -550,13 +550,42 @@ impl Engine {
                     "show" => win::show(g.win),
                     _ => {
                         refuse_disabled(g.win, None)?;
-                        win::close(g.win);
+                        let uwp_app = (win::class_of(g.win) == "ApplicationFrameWindow").then(|| win::app_pid(g.win)).filter(|&p| p != win::pid(g.win));
+                        // Ghost's own browser closes over DevTools: WM_CLOSE waits on its UI thread, which under
+                        // load ran past the 10 s request deadline (web-features run 5, 2026-10-17).
+                        let dir = lock(&BROWSER).get(&hv(g.win)).map(|b| b.dir.clone());
+                        let by_cdp = match dir.map(|d| crate::cdp::close(&d)) {
+                            Some(Ok(())) => true,
+                            Some(Err(e)) => {
+                                dbg(&format!("close {}: path wm_close, cdp {e}", hv(g.win)));
+                                false
+                            }
+                            None => false,
+                        };
+                        if by_cdp {
+                            dbg(&format!("close {}: path cdp Browser.close", hv(g.win)));
+                            let _ = std::fs::remove_file(win::park_file(g.win));
+                        } else {
+                            win::close(g.win);
+                        }
                         let t = now_ms();
-                        while win::is_window(g.win) && now_ms() - t < 1000 {
+                        while win::is_window(g.win) && now_ms() - t < 5000 {
                             std::thread::sleep(std::time::Duration::from_millis(10));
                         }
                         if win::is_window(g.win) {
                             return ghost(self.still_open(g.win));
+                        }
+                        // A UWP app outlives its frame for a moment; launched again within ~1.5 s, its new window
+                        // stays outside the new frame and launch times out (measured 2026-10-18: back to back, every
+                        // second `launch calc` failed; 1.5 s apart, 4 of 4 ran). See UWP_CLOSED.
+                        if let Some(p) = uwp_app {
+                            *lock(&UWP_CLOSED) = Some(now_ms());
+                            if let Ok(ph) = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, p) } {
+                                let r = unsafe { WaitForSingleObject(ph, 5000) };
+                                let _ = unsafe { CloseHandle(ph) };
+                                dbg(&format!("close {}: uwp app pid {p} {}", hv(g.win), if r == WAIT_OBJECT_0 { "exited" } else { "still running after 5 s" }));
+                            }
+                            *lock(&UWP_CLOSED) = Some(now_ms());
                         }
                         forget(g.win);
                         self.states.remove(&hv(g.win));
@@ -682,9 +711,13 @@ impl Engine {
                 parts.insert(1, hv(w).to_string());
             }
             cx.step = Some(k);
+            let cur_before = cx.cur;
             let r = self.run(cx, &parts);
             cx.step = None;
-            if (launch || go) && r.is_ok() {
+            // A launch that recorded its window in launched.txt and then failed still made it the run's window, so a
+            // trailing close shuts it (verifier, round 15: two Calculators were left open).
+            let recorded = launch && cx.cur != 0 && cx.cur != cur_before && lock(&LAUNCHED).contains_key(&cx.cur);
+            if ((launch || go) && r.is_ok()) || recorded {
                 win = Some(hwnd(cx.cur)); // the launched (or relaunched) window is the target of the steps after it
             }
             let r = match r {
@@ -693,13 +726,24 @@ impl Engine {
                 Err(Fail::Ghost(m)) => Fail::Ghost(format!("step {k}: {m}")),
             };
             if close_last && idx + 1 < steps.len() {
-                if let Some(w) = win.filter(|&w| win::is_window(w)) {
-                    let kc = steps[steps.len() - 1].0;
-                    cx.step = Some(kc);
-                    if let Err(Fail::Usage(m) | Fail::Ghost(m)) = self.run(cx, &["close".to_string(), hv(w).to_string()]) {
-                        cx.line(&format!("{kc} close failed: {m}"));
+                let kc = steps[steps.len() - 1].0;
+                dbg(&format!("run: step {k} failed; finally close of {:?} (window {})", win.map(hv), win.map(win::is_window).unwrap_or(false)));
+                match win {
+                    Some(w) if win::is_window(w) => {
+                        cx.step = Some(kc);
+                        if let Err(Fail::Usage(m) | Fail::Ghost(m)) = self.run(cx, &["close".to_string(), hv(w).to_string()]) {
+                            cx.line(&format!("{kc} close failed: {m}"));
+                        }
+                        cx.step = None;
                     }
-                    cx.step = None;
+                    // Already gone by itself (a folder window's own explorer.exe exited, 2 of 10 N1 runs on
+                    // 2026-10-18): the finally's goal holds, and it says so rather than staying silent.
+                    Some(w) => {
+                        dbg(&format!("run: {} was already closed before the finally close", hv(w)));
+                        forget(w);
+                        cx.line(&format!("{kc} closed"));
+                    }
+                    None => {}
                 }
             }
             return Err(r);
@@ -825,6 +869,76 @@ mod tests {
         assert_eq!(delay_ms("1.5s"), None);
         assert_eq!(delay_ms("Settings"), None);
         assert_eq!(delay_ms("ms"), None);
+    }
+    #[test]
+    fn hung_owner_window_is_handed_back() {
+        // A window whose thread stops answering is hung (IsHungAppWindow after 5 s), but it is still the owner's
+        // window: handback must return it, never the sink or the taskbar.
+        use crate::win;
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || unsafe {
+            let h = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, windows::core::w!("STATIC"), windows::core::w!("hung"), WS_POPUP | WS_VISIBLE, -32000, -32000, 1, 1, None, None, None, None).unwrap();
+            tx.send(win::hv(h)).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(6500)); // stop pumping: the window goes hung
+            let _ = DestroyWindow(h);
+        });
+        let h = win::hwnd(rx.recv().unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(5800));
+        assert!(unsafe { IsHungAppWindow(h).as_bool() }, "the test window never went hung");
+        assert_eq!(win::owner_window(h), h);
+        assert_eq!(win::handback(h, Default::default()), h, "a hung owner window was swapped for the sink or the taskbar");
+        t.join().unwrap();
+    }
+    #[test]
+    fn uwp_classifier() {
+        use super::uwp_kind;
+        use std::path::{Path, PathBuf};
+        let wa = Path::new(r"C:\U\WindowsApps");
+        let links = |set: &'static [&'static str]| move |p: &Path| set.iter().any(|s| p == Path::new(s));
+        let none = links(&[]);
+        let notepad_app = links(&[r"C:\U\WindowsApps\notepad.exe"]);
+        assert!(uwp_kind("calc", &none, Some(wa), None));
+        assert!(uwp_kind(r"C:\Windows\System32\calc.exe", &none, Some(wa), None));
+        assert!(uwp_kind("ms-settings:display", &none, Some(wa), None));
+        assert!(uwp_kind(r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", &none, Some(wa), None));
+        assert!(!uwp_kind("notepad", &none, Some(wa), None), "classic Notepad only: not UWP");
+        assert!(uwp_kind("notepad.exe", &notepad_app, Some(wa), None), "packaged Notepad's alias installed");
+        assert!(uwp_kind("wt", &links(&[r"C:\U\WindowsApps\wt.exe"]), Some(wa), Some(PathBuf::from(r"C:\U\WindowsApps\wt.exe"))));
+        assert!(!uwp_kind("explorer.exe", &none, Some(wa), Some(PathBuf::from(r"C:\Windows\explorer.exe"))));
+        assert!(!uwp_kind("mailto:a@b.c", &none, Some(wa), None));
+        assert!(!uwp_kind("mspaint", &none, None, None));
+    }
+    #[test]
+    fn handback_prior_rules() {
+        // Round 11: the prior foreground goes back as long as it exists, hidden or transient; gone, the owner's
+        // last visible window; the sink (the taskbar here: no sink in tests) only for prior 0 or none left.
+        use crate::win;
+        use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        unsafe extern "system" fn proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+            unsafe { DefWindowProcW(h, m, w, l) }
+        }
+        unsafe {
+            let wc = WNDCLASSW { lpfnWndProc: Some(proc), lpszClassName: windows::core::w!("ForegroundStaging"), ..Default::default() };
+            RegisterClassW(&wc);
+            let mk = |class: windows::core::PCWSTR, style: WINDOW_STYLE| CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, class, windows::core::w!("t"), WS_POPUP | style, -32000, -32000, 1, 1, None, None, None, None).unwrap();
+            let last = mk(windows::core::w!("STATIC"), WS_VISIBLE);
+            let transient = mk(windows::core::w!("ForegroundStaging"), WS_VISIBLE);
+            let hidden = mk(windows::core::w!("STATIC"), WINDOW_STYLE(0));
+            let gone = mk(windows::core::w!("STATIC"), WS_VISIBLE);
+            DestroyWindow(gone).unwrap();
+            assert!(!win::user_window(transient) && !win::user_window(hidden) && win::user_window(last));
+            assert_eq!(win::handback(transient, last), transient, "transient prior");
+            assert_eq!(win::handback(hidden, last), hidden, "hidden prior");
+            assert_eq!(win::handback(gone, last), last, "prior gone");
+            assert_eq!(win::handback(gone, gone), win::taskbar(), "prior and last user window both gone");
+            assert_eq!(win::handback(HWND::default(), last), win::taskbar(), "prior 0");
+            assert_eq!(win::handback(win::taskbar(), last), win::taskbar(), "taskbar prior counts as 0");
+            for h in [last, transient, hidden] {
+                let _ = DestroyWindow(h);
+            }
+        }
     }
     #[test]
     fn stale_park_files() {
@@ -1658,7 +1772,14 @@ impl Engine {
                         (nav_ms, is_btn) = nav_expect(&el, before_id.as_ref().map(|(_, u)| u.as_str()).unwrap_or(""));
                     }
                     self.sendable(h)?;
-                    click_el(self.uia()?, h, &el)?
+                    let check = check_of(&el).filter(|_| unsafe { [UIA_CheckBoxControlTypeId, UIA_RadioButtonControlTypeId].contains(&el.CurrentControlType().unwrap_or_default()) });
+                    match self.cdp_on(h, &el, "click", |s, n| {
+                        s.call("DOM.scrollIntoViewIfNeeded", &format!(r#"{{"backendNodeId":{n}}}"#)).map_err(|e| crate::cdp::CallErr::Unsent(e.to_string()))?;
+                        crate::cdp::on_node(s, n, "function(){ this.click(); }")
+                    }) {
+                        Some(r) => r.map(|_| ("cdp_click".to_string(), check))?,
+                        None => click_el(self.uia()?, h, &el)?,
+                    }
                 }
             }
             "type" => self.type_text(h, &rest)?,
@@ -1906,6 +2027,29 @@ impl Engine {
                 return usage(format!("type: unknown option {r}"));
             }
         }
+        // Ghost's own browser: focus, clear and insert over the DevTools protocol (UIA SetValue activated Edge).
+        if lock(&BROWSER).contains_key(&hv(h)) {
+            let cur = unsafe { el.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId).and_then(|vp| vp.CurrentValue()).map(|b| b.to_string()).unwrap_or_default() };
+            let nv = if append { format!("{cur}{text}") } else { text.clone() };
+            let prep = if append {
+                "function(){ try { const n = this.value.length; this.setSelectionRange(n, n); } catch (e) {} }"
+            } else {
+                "function(){ if ('value' in this) { this.value = ''; } else { this.textContent = ''; } this.dispatchEvent(new Event('input', { bubbles: true })); }"
+            };
+            let r = self.cdp_on(h, &el, "type", |s, n| {
+                let safe = |e: crate::cdp::CallErr| crate::cdp::CallErr::Unsent(e.to_string());
+                s.call("DOM.focus", &format!(r#"{{"backendNodeId":{n}}}"#)).map_err(safe)?;
+                crate::cdp::on_node(s, n, prep).map_err(safe)?;
+                if text.is_empty() {
+                    return Ok(());
+                }
+                // Replacing: a failed insert is redone whole by UIA below. Appending: it may have landed, so it stops.
+                s.call("Input.insertText", &format!(r#"{{"text":{}}}"#, crate::cdp::json_str(&text))).map(|_| ()).map_err(|e| if append { e } else { safe(e) })
+            });
+            if let Some(r) = r {
+                return r.map(|_| ("cdp_insert".to_string(), check(HWND::default(), nv, false)));
+            }
+        }
         unsafe {
             // A native edit control takes WM_SETTEXT with no focus change; Windows' UIA proxy for it focuses (and
             // can activate) the window on SetValue. So native edits skip ValuePattern.
@@ -2018,46 +2162,198 @@ impl Engine {
     }
 
     /// `go <url>`: typing into a browser's address bar takes the foreground (UIA SetValue there activates the
-    /// window, measured), so the URL opens in a new background instance of the same browser, launched like
-    /// `launch` with a fresh throwaway profile, and the old window closes. History and cookies don't carry over.
+    /// window, measured). On ghost's own browsers the tab navigates in place over the DevTools protocol (cdp.rs);
+    /// without it (a browser started before ghost opened the port) the URL is handed to the running instance,
+    /// which opens a new tab, and the old tab is closed. Both keep the window, its cookies and session.
     fn go(&mut self, cx: &mut Ctx, g: Args) -> R<()> {
         let h = g.win;
         let Some(br) = lock(&BROWSER).get(&hv(h)).cloned() else {
             return ghost("go works in a browser ghost launched with its own profile (no --user-data-dir); start one at the page: ghost launch msedge <url>");
         };
-        let mut a = vec!["launch".to_string(), br.exe];
-        a.extend(br.args);
-        a.push(g.pos[0].clone());
-        let (found, _) = self.launch_win(cx, &a)?;
-        let nodes = self.settle_page(found, win::app_pid(found), now_ms())?;
+        daemon::wait_rest();
+        let pid = win::pid(h);
+        let back = daemon::handback_from(unsafe { GetForegroundWindow() });
+        daemon::mark_act(pid);
+        let t0 = now_ms();
+        dbg(&format!("go: {}", daemon::lock_state()));
+        // Any activation while navigating is taken straight back.
+        let hold = |pid: u32| {
+            let cur = unsafe { GetForegroundWindow() };
+            if cur != back && !cur.0.is_null() && (win::pid(cur) == pid || ghost_window(cur)) {
+                dbg(&format!("go: {} ({}) in front at +{} ms, {}", hv(cur), win::class_of(cur), now_ms() - t0, daemon::lock_state()));
+                win::restore_foreground(back, cur);
+            }
+            daemon::mark_act(pid);
+        };
+        match crate::cdp::navigate(&br.dir, &win::title(h), &g.pos[0]) {
+            Ok(note) => dbg(&format!("go: path cdp, replied +{} ms{}", now_ms() - t0, note.map(|n| format!(", {n}")).unwrap_or_default())),
+            Err(why) => {
+                dbg(&format!("go: path hand-off, cdp unavailable: {why}"));
+                self.go_handoff(cx, h, &br, &g.pos[0], t0, &hold)?;
+            }
+        }
+        // Settle the new page while still reclaiming the foreground each poll: an empty page (about:blank) waits up
+        // to 2 s for quiet, and the browser would otherwise hold the foreground for that whole time.
+        let apid = win::app_pid(h);
+        let nodes = loop {
+            hold(pid);
+            let nodes = self.snapshot(h, false)?;
+            let page = page_range(&nodes, &win::title(h));
+            let now = now_ms();
+            let quiet = now.saturating_sub(daemon::last_event(apid).max(t0));
+            let ready = page.map(|(s, e)| (e > s + 1 && quiet >= 500) || quiet >= 2000).unwrap_or(false);
+            if ready || now - t0 >= 10_000 {
+                break nodes;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+        hold(pid);
+        // The handoff's short-lived process and the new tab can activate the browser a tick or two after settle.
+        // A brief synchronous poll catches that in a few ms, rather than waiting on the async WinEvent hook (whose
+        // out-of-context delivery was measured at 60-110 ms under load, long enough to look like a flash).
+        let tail = now_ms();
+        while now_ms() - tail < 150 {
+            hold(pid);
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        self.st(h).last = Some(nodes.clone());
         let k = cx.step.map(|k| format!("{k} ")).unwrap_or_default();
-        cx.line(&format!("{} {} {}", hv(found), win::pid(found), win::proc_name(win::pid(found))));
-        cx.out.push_str(&format!("{k}nav {}", page_text(&nodes, &win::title(found), NAV_CAP, Some(&g.pos[0]))));
-        // The old window goes last, so a failed launch leaves the agent where it was.
-        daemon::mark_act(win::pid(h));
-        win::close(h);
-        let t = now_ms();
-        while win::is_window(h) && now_ms() - t < 3000 {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+        cx.line(&format!("{} {} {}", hv(h), pid, win::proc_name(pid)));
+        cx.out.push_str(&format!("{k}nav {}", page_text(&nodes, &win::title(h), NAV_CAP, Some(&g.pos[0]))));
+        daemon::fg_check(pid).map_err(Fail::Ghost)
+    }
+
+    /// Runs `f` on the page element `el` names, over the DevTools protocol, in a browser ghost launched. None: not
+    /// available here (not ghost's browser, a role or name CDP can't match to exactly one element, the port gone,
+    /// or a step that failed before it changed anything): the caller uses UIA. Some(Err): it failed after acting.
+    fn cdp_on(&mut self, h: HWND, el: &IUIAutomationElement, what: &str, f: impl FnOnce(&mut crate::cdp::Session, u64) -> Result<(), crate::cdp::CallErr>) -> Option<R<()>> {
+        let dir = lock(&BROWSER).get(&hv(h)).map(|b| b.dir.clone())?;
+        let (name, ct) = unsafe { (el.CurrentName().map(|b| b.to_string()).unwrap_or_default(), el.CurrentControlType().unwrap_or_default()) };
+        let roles = ax_roles(ct);
+        let t0 = now_ms();
+        let skip = |why: String| {
+            dbg(&format!("{what} {}: path uia, cdp {why}", hv(h)));
+            None
+        };
+        if name.is_empty() || roles.is_empty() {
+            return skip(format!("can't match \"{name}\" (control type {})", ct.0));
         }
-        if win::is_window(h) {
-            return ghost(format!("opened the page in {}, but the old window is {}", hv(found), self.still_open(h)));
+        let mut s = match crate::cdp::Session::page(&dir, &win::title(h)) {
+            Ok(s) => s,
+            Err(e) => return skip(format!("unavailable: {e}")),
+        };
+        let node = match crate::cdp::find(&mut s, &name, roles) {
+            Ok(Some(n)) => n,
+            Ok(None) => return skip(format!("found no single {roles:?} named \"{name}\"")),
+            Err(e) => return skip(format!("query failed: {e}")),
+        };
+        match f(&mut s, node) {
+            Ok(()) => {
+                dbg(&format!("{what} {}: path cdp, node {node}, {} ms", hv(h), now_ms() - t0));
+                Some(Ok(()))
+            }
+            Err(crate::cdp::CallErr::Unsent(e)) => skip(format!("step failed before acting: {e}")),
+            Err(crate::cdp::CallErr::Sent(e)) => Some(ghost(format!("{what} over DevTools failed after it was sent (it may still apply): {e}"))),
         }
-        forget(h);
-        lock(&BROWSER).remove(&hv(h));
-        self.states.remove(&hv(h));
+    }
+
+    /// `go`'s fallback: the URL handed to the running instance (a new tab), then the old tab closed in place.
+    fn go_handoff(&mut self, cx: &mut Ctx, h: HWND, br: &Br, url: &str, t0: u64, hold: &dyn Fn(u32)) -> R<()> {
+        let pid = win::pid(h);
+        let tabs = |n: &[Node]| -> Vec<u32> { n.iter().filter(|x| x.role == "ti").map(|x| x.n).collect() };
+        let old = tabs(&self.snapshot(h, true)?);
+        // The same exe on the same profile: Chromium hands the URL to the running instance, which opens it in a
+        // new tab of this window, so cookies and the session stay. (SetValue on the address bar activates the
+        // browser: see chrome_edit.)
+        let cmd = format!("{} {} {}", quote(&br.exe), quote(&format!("--user-data-dir={}", br.dir)), quote(url));
+        spawn(&cmd, &cx.cwd)?;
+        dbg(&format!("go: spawned +{} ms", now_ms() - t0));
+        loop {
+            hold(pid);
+            let now = tabs(&self.snapshot(h, true)?);
+            if now.iter().any(|n| !old.contains(n)) {
+                dbg(&format!("go: new tab +{} ms", now_ms() - t0));
+                break;
+            }
+            if now_ms() - t0 > 10_000 {
+                return ghost("the browser did not open the page in a new tab within 10 s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // The old tab closes in place: its own close button, invoked under the shield.
+        let all = self.snapshot(h, true)?;
+        for (i, n) in all.iter().enumerate().filter(|(_, n)| n.role == "ti" && old.contains(&n.n)) {
+            let close = all[i + 1..].iter().take_while(|c| c.depth > n.depth).find(|c| c.role == "btn").and_then(|c| c.el.clone());
+            let Some(el) = close else { return ghost(format!("opened the page in a new tab, but the old tab has no close button: {}", clip(&n.name, 60))) };
+            let p = unsafe { el.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId) }?;
+            shielded(h, || unsafe { p.Invoke() })?;
+            dbg(&format!("go: old tab close invoked +{} ms", now_ms() - t0));
+            hold(pid);
+        }
+        loop {
+            hold(pid);
+            let now = tabs(&self.snapshot(h, true)?);
+            if !now.iter().any(|n| old.contains(n)) {
+                dbg(&format!("go: old tab closed +{} ms", now_ms() - t0));
+                break;
+            }
+            if now_ms() - t0 > 12_000 {
+                return ghost("opened the page in a new tab, but the old tab is still open");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         Ok(())
     }
 
     /// Starts the program parked and returns its window, and whether it is a browser given a URL.
     fn launch_win(&mut self, cx: &mut Ctx, a: &[String]) -> R<(HWND, bool)> {
-        daemon::wait_rest();
-        let before: HashSet<isize> = win::top_windows().into_iter().map(hv).collect();
-        let fg = unsafe { GetForegroundWindow() };
         let uri = is_uri(&a[1]);
         // `launch msedge`: a bare name that isn't on PATH is looked up in App Paths, as the Run box does.
         let exe = if uri { None } else { app_path(&a[1]) }.unwrap_or_else(|| a[1].clone());
         let base = std::path::Path::new(&exe).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+        // Only a target that opened a UWP frame before (calc, an AUMID, ms-settings:) waits after a UWP close.
+        let target = a[1].to_lowercase();
+        if let Some(t) = (*lock(&UWP_CLOSED)).filter(|_| lock(&UWP_TARGETS).contains(&target)) {
+            let left = (t + UWP_COOLDOWN_MS).saturating_sub(now_ms());
+            if left > 0 {
+                dbg(&format!("launch: waiting {left} ms after a UWP close"));
+                std::thread::sleep(std::time::Duration::from_millis(left));
+            }
+        }
+        daemon::wait_rest();
+        // A UWP app is activated by the system at launch. With the owner active ghost can't hold the foreground
+        // lock, and then nothing it does (SetForegroundWindow, hiding, minimizing) takes the foreground back from the
+        // new frame (budget N2, 2026-10-18: lock refused with error 5 in every failing run, taken in every passing
+        // one). Windows refuses the lock while the owner types, so such a launch waits for a second without input
+        // and tries again, 20 s at most, and is refused rather than steal the foreground.
+        if lock(&UWP_TARGETS).contains(&target) || uwp_target(&a[1]) {
+            // Windows grants the lock only after ForegroundLockTimeout without input (200 s by default, read here):
+            // a wait that can't reach it in the 20 s stops at once instead of idling for nothing.
+            let mut fglt = 0u32;
+            let _ = unsafe { SystemParametersInfoW(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, Some(&mut fglt as *mut u32 as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)) };
+            let t = now_ms();
+            daemon::mark_act(0);
+            let mut why = String::new();
+            while !daemon::lock_held() {
+                let (left, idle) = (20_000u64.saturating_sub(now_ms() - t), idle_ms());
+                if left == 0 || (fglt as u64).saturating_sub(idle) > left {
+                    why = format!("idle {idle} ms, the lock needs {fglt} ms without input");
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if idle_ms() >= 1000 {
+                    daemon::mark_act(0);
+                }
+            }
+            let waited = now_ms() - t;
+            if !daemon::lock_held() {
+                dbg(&format!("launch {target}: uwp, refused after {waited} ms ({why}), foreground lock not available ({})", daemon::lock_state()));
+                return ghost("background unavailable: you are using the PC, and this app takes the foreground when it starts; nothing was launched. Retry when the PC is idle");
+            }
+            dbg(&format!("launch {target}: uwp, lock held after {waited} ms"));
+        }
+        let before: HashSet<isize> = win::top_windows().into_iter().map(hv).collect();
+        let fg = unsafe { GetForegroundWindow() };
         let browser = BROWSERS.contains(&base.as_str());
         // Chromium keeps only the last --disable-features, so the caller's list is merged into ghost's one.
         let mut off = vec!["CalculateNativeWinOcclusion".to_string()];
@@ -2080,6 +2376,7 @@ impl Engine {
         }
         // Its own throwaway profile, so it is always a new instance and never hands the URL to the owner's browser.
         let profiled = PROFILED.contains(&base.as_str()) && !a[2..].iter().any(|x| x.to_lowercase().starts_with("--user-data-dir"));
+        let mut pdir = String::new();
         if profiled {
             // Never a relative fallback: without LOCALAPPDATA the profile would land in the caller's directory.
             let Some(base) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) else {
@@ -2088,27 +2385,18 @@ impl Engine {
             let dir = std::path::PathBuf::from(base).join("ghost").join("profiles").join(format!("{PROFILE_PREFIX}{}", filetime_now()));
             let _ = std::fs::create_dir_all(&dir);
             prune_profiles(dir.clone());
+            pdir = dir.display().to_string();
             cmd.push(' ');
             cmd.push_str(&quote(&format!("--user-data-dir={}", dir.display())));
-            cmd.push_str(" --no-first-run --no-default-browser-check");
+            // DevTools on 127.0.0.1, random port, for `go` (see cdp.rs); only on these throwaway profiles.
+            cmd.push_str(" --no-first-run --no-default-browser-check --remote-debugging-port=0");
         }
         let url = BROWSERS.contains(&base.as_str()) && a[2..].iter().any(|x| !x.starts_with('-'));
         let t0 = filetime_now();
         let root = if uri {
             shell_launch(&a[1], &a[2..])? // ms-settings:..., other protocols, shell:AppsFolder\<AUMID>
         } else {
-            let mut wcmd = win::wide(&cmd);
-            let si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, dwFlags: STARTF_USESHOWWINDOW, wShowWindow: SW_SHOWNOACTIVATE.0 as u16, ..Default::default() };
-            let mut pi = PROCESS_INFORMATION::default();
-            let dir = if !cx.cwd.is_empty() && std::path::Path::new(&cx.cwd).is_dir() { Some(win::wide(&cx.cwd)) } else { None };
-            unsafe {
-                // inherit=false: the child must not hold any of our handles
-                CreateProcessW(PCWSTR::null(), Some(PWSTR(wcmd.as_mut_ptr())), None, None, false, PROCESS_CREATION_FLAGS(0), None, dir.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())), &si, &mut pi)
-                    .map_err(|e| Fail::Ghost(format!("CreateProcess failed for {}: {}", exe, e.message())))?;
-                let _ = CloseHandle(pi.hThread);
-                let _ = CloseHandle(pi.hProcess);
-            }
-            pi.dwProcessId
+            spawn(&cmd, &cx.cwd)?
         };
         daemon::mark_act(root);
         *lock(&PENDING) = Some((root, base.clone(), t0));
@@ -2116,6 +2404,7 @@ impl Engine {
         let sw = now_ms();
         let mut verdict: HashMap<u32, bool> = HashMap::new();
         let mut found = HWND::default();
+        let mut seen: HashSet<isize> = HashSet::new();
         while found.0.is_null() && now_ms() - sw < 15000 {
             for h in win::top_windows() {
                 if before.contains(&hv(h)) || !win::visible(h) {
@@ -2127,6 +2416,10 @@ impl Engine {
                     }
                 }
                 let p = win::pid(h);
+                if seen.insert(hv(h)) {
+                    let ap = win::app_pid(h);
+                    dbg(&format!("launch: new window {} class {} pid {} app pid {} ({}, started {:?}, launch t0 {t0})", hv(h), win::class_of(h), p, ap, win::proc_name(ap), proc_start(ap)));
+                }
                 if win::class_of(h) == "ApplicationFrameWindow" {
                     // UWP: ApplicationFrameHost owns the frame; the app is the process of the CoreWindow it hosts,
                     // which arrives a moment later. Ours if that is the activated pid or started after launch.
@@ -2152,40 +2445,72 @@ impl Engine {
             return ghost(format!("no new window from the launched process appeared within 15 s (pid {root}){why}"));
         }
         let fpid = win::pid(found);
+        if win::class_of(found) == "ApplicationFrameWindow" {
+            let mut u = lock(&UWP_TARGETS);
+            if u.insert(target.clone()) {
+                let _ = std::fs::write(win::state_dir().join("uwp-targets.txt"), u.iter().map(|t| format!("{t}\n")).collect::<String>());
+            }
+        }
         daemon::mark_act(fpid);
         win::park(found).map_err(Fail::Ghost)?;
         // The app may activate itself or restore its saved position a moment after showing. With no window in
         // front before (foreground 0) it goes to win::handback's choice: "no window" can't be handed back to.
-        let back = win::handback(fg);
+        let back = daemon::handback_from(fg);
         // From here the window is ghost's, even if this launch fails: the caller must be able to close it.
         cx.cur = hv(found);
         cx.launched = true;
         self.add_launched(found);
+        // The launched app in front: its window, any window of its app process (app_pid: for UWP, pid is the shared
+        // ApplicationFrameHost, which also hosts the owner's own UWP windows), or the launch root.
+        let app = Some(win::app_pid(found)).filter(|&a| a != win::pid(found) || win::class_of(found) != "ApplicationFrameWindow"); // a UWP frame without its app yet: by hwnd only
+        let in_front = |w: HWND| !w.0.is_null() && w != back && (w == found || app.is_some_and(|a| win::app_pid(w) == a) || win::pid(w) == root || ghost_window(w));
         let guard = now_ms();
         while now_ms() - guard < 1000 || (win::title(found).is_empty() && now_ms() - sw < 15000) {
             if !win::is_window(found) {
                 return ghost("launched window closed itself");
             }
             let cur = unsafe { GetForegroundWindow() };
-            if cur != back && !cur.0.is_null() && (win::pid(cur) == fpid || win::pid(cur) == root || ghost_window(cur)) {
+            if in_front(cur) {
                 win::restore_foreground(back, cur);
             }
             let _ = win::park(found);
             daemon::mark_act(fpid);
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let last = unsafe { GetForegroundWindow() };
-        if last != back && win::pid(last) == fpid {
+        // Another app (the owner's) in front now means ghost's steal is over. Only the launched app itself still in
+        // front is a failure, after one more push (restore_foreground hides ghost's own window if it must).
+        let mut last = unsafe { GetForegroundWindow() };
+        if in_front(last) {
+            win::restore_foreground(back, last);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            last = unsafe { GetForegroundWindow() };
+        }
+        if in_front(last) {
             return ghost(format!("background unavailable: app took focus and it could not be returned (window {})", win::line(found)));
         }
         if profiled {
-            let args = a[2..].iter().filter(|x| x.starts_with('-')).cloned().collect();
             let mut b = lock(&BROWSER);
             b.retain(|&k, _| win::is_window(hwnd(k)));
-            b.insert(hv(found), Br { exe, args });
+            b.insert(hv(found), Br { exe, dir: pdir });
         }
         Ok((found, url))
     }
+}
+
+/// Starts `cmd` unactivated (SW_SHOWNOACTIVATE) in `cwd`, inheriting no handles; returns its pid.
+fn spawn(cmd: &str, cwd: &str) -> R<u32> {
+    let mut wcmd = win::wide(cmd);
+    let si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, dwFlags: STARTF_USESHOWWINDOW, wShowWindow: SW_SHOWNOACTIVATE.0 as u16, ..Default::default() };
+    let mut pi = PROCESS_INFORMATION::default();
+    let dir = if !cwd.is_empty() && std::path::Path::new(cwd).is_dir() { Some(win::wide(cwd)) } else { None };
+    unsafe {
+        // inherit=false: the child must not hold any of our handles
+        CreateProcessW(PCWSTR::null(), Some(PWSTR(wcmd.as_mut_ptr())), None, None, false, PROCESS_CREATION_FLAGS(0), None, dir.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())), &si, &mut pi)
+            .map_err(|e| Fail::Ghost(format!("CreateProcess failed for {cmd}: {}", e.message())))?;
+        let _ = CloseHandle(pi.hThread);
+        let _ = CloseHandle(pi.hProcess);
+    }
+    Ok(pi.dwProcessId)
 }
 
 /// The launch in progress: (root pid, exe base name, start FILETIME). Until launch finds and parks its window,
@@ -2198,6 +2523,11 @@ impl Drop for Pending {
         *lock(&PENDING) = None;
     }
 }
+/// A process ghost launched: its other windows (a hidden Chromium helper) are not the owner's either.
+pub fn ghost_pid(pid: u32) -> bool {
+    lock(&LAUNCHED).values().any(|e| e.pid == pid)
+}
+
 /// A process the launch in progress started: the root itself, or a same-named process started after it (the
 /// rule `from_launch` uses, minus the descendant walk, which is too slow for the guard).
 pub fn pending_launch(pid: u32) -> bool {
@@ -2213,6 +2543,15 @@ pub fn ghost_window(h: HWND) -> bool {
     !r.0.is_null() && (hv(r) == win::SINK.load(std::sync::atomic::Ordering::SeqCst) || lock(&LAUNCHED).get(&hv(r)).is_some_and(|e| alive(r, e)) || win::park_owned(r))
 }
 
+/// When ghost last closed a UWP app's window: a launch within UWP_COOLDOWN_MS of it waits out the rest (see close).
+static UWP_CLOSED: LazyLock<Mutex<Option<u64>>> = LazyLock::new(Default::default);
+/// Launch targets (as given, lowercased) that opened a UWP frame: only these wait out UWP_COOLDOWN_MS and need the
+/// foreground lock. Kept in uwp-targets.txt so a daemon restart remembers them.
+static UWP_TARGETS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| {
+    Mutex::new(std::fs::read_to_string(win::state_dir().join("uwp-targets.txt")).unwrap_or_default().lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+});
+const UWP_COOLDOWN_MS: u64 = 1500;
+
 /// Throwaway profile folders are `ghost-<FILETIME>`; cleanup touches nothing else.
 const PROFILE_PREFIX: &str = "ghost-";
 
@@ -2225,7 +2564,7 @@ fn ghost_profile(name: &str) -> bool {
 #[derive(Clone)]
 struct Br {
     exe: String,
-    args: Vec<String>,
+    dir: String, // its throwaway --user-data-dir
 }
 static BROWSER: LazyLock<Mutex<HashMap<isize, Br>>> = LazyLock::new(Default::default);
 
@@ -2276,6 +2615,72 @@ fn app_path(name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// How long since the owner's last keyboard or mouse input (GetLastInputInfo; reads, never sends).
+fn idle_ms() -> u64 {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut li = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    if !unsafe { GetLastInputInfo(&mut li) }.as_bool() {
+        return 0;
+    }
+    unsafe { windows::Win32::System::SystemInformation::GetTickCount() }.wrapping_sub(li.dwTime) as u64
+}
+
+/// Whether launching `target` starts a packaged (UWP) app, which the system activates (takes the foreground) as it
+/// starts. Before any launch: see uwp_kind; the learned uwp-targets.txt covers the rest.
+fn uwp_target(target: &str) -> bool {
+    let wa = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("Microsoft").join("WindowsApps"));
+    uwp_kind(target, appexeclink, wa.as_deref(), resolve_exe(target))
+}
+
+/// UWP when: an `ms-...:` protocol or `shell:AppsFolder\` path; a program that resolves to an App Execution Alias
+/// (an IO_REPARSE_TAG_APPEXECLINK reparse point, the WindowsApps aliases); or a System32 stub that hands off to a
+/// packaged app: calc always, notepad, mspaint and snippingtool only when their packaged app's alias is installed.
+fn uwp_kind(target: &str, is_link: impl Fn(&std::path::Path) -> bool, windows_apps: Option<&std::path::Path>, resolved: Option<std::path::PathBuf>) -> bool {
+    let t = target.trim().to_lowercase();
+    if (t.starts_with("ms-") && t.contains(':')) || t.starts_with("shell:appsfolder\\") {
+        return true;
+    }
+    if resolved.as_deref().is_some_and(&is_link) {
+        return true;
+    }
+    let file = t.rsplit(['\\', '/']).next().unwrap_or(&t);
+    let stem = file.strip_suffix(".exe").unwrap_or(file);
+    match stem {
+        "calc" => true,
+        "notepad" | "mspaint" | "snippingtool" => windows_apps.is_some_and(|w| is_link(&w.join(format!("{stem}.exe")))),
+        _ => false,
+    }
+}
+
+/// `target` as a file: itself if it names one, else found on the search path (with .exe added).
+fn resolve_exe(target: &str) -> Option<std::path::PathBuf> {
+    use windows::Win32::Storage::FileSystem::SearchPathW;
+    let p = std::path::Path::new(target);
+    if target.contains(['\\', '/']) {
+        return p.is_file().then(|| p.to_path_buf());
+    }
+    let exe = if target.to_lowercase().ends_with(".exe") { target.to_string() } else { format!("{target}.exe") };
+    let w = win::wide(&exe);
+    let mut buf = [0u16; 1024];
+    let n = unsafe { SearchPathW(PCWSTR::null(), PCWSTR(w.as_ptr()), PCWSTR::null(), Some(&mut buf), None) } as usize;
+    (n > 0 && n < buf.len()).then(|| std::path::PathBuf::from(String::from_utf16_lossy(&buf[..n])))
+}
+
+/// An App Execution Alias: a reparse point tagged IO_REPARSE_TAG_APPEXECLINK.
+fn appexeclink(p: &std::path::Path) -> bool {
+    use windows::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, FILE_ATTRIBUTE_REPARSE_POINT, WIN32_FIND_DATAW};
+    const IO_REPARSE_TAG_APPEXECLINK: u32 = 0x8000_001B;
+    let w = win::wide(&p.to_string_lossy());
+    let mut d = WIN32_FIND_DATAW::default();
+    match unsafe { FindFirstFileW(PCWSTR(w.as_ptr()), &mut d) } {
+        Ok(h) => {
+            let _ = unsafe { FindClose(h) };
+            d.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 && d.dwReserved0 == IO_REPARSE_TAG_APPEXECLINK
+        }
+        Err(_) => false,
+    }
 }
 
 /// A protocol URI (ms-settings:about) or shell:AppsFolder\<AUMID>, as opposed to a program path.
@@ -2575,6 +2980,21 @@ fn win_state(h: HWND) -> (bool, bool) {
 fn current(el: &IUIAutomationElement, id: UIA_PROPERTY_ID) -> Option<Var> {
     unsafe { el.GetCurrentPropertyValue(id).ok().map(Var) }
 }
+/// The accessibility roles CDP's queryAXTree knows a UIA control type by; none for types not matched over CDP.
+fn ax_roles(ct: UIA_CONTROLTYPE_ID) -> &'static [&'static str] {
+    let m: [(UIA_CONTROLTYPE_ID, &'static [&'static str]); 8] = [
+        (UIA_ButtonControlTypeId, &["button"]),
+        (UIA_HyperlinkControlTypeId, &["link"]),
+        (UIA_EditControlTypeId, &["textbox", "searchbox", "combobox"]),
+        (UIA_CheckBoxControlTypeId, &["checkbox"]),
+        (UIA_RadioButtonControlTypeId, &["radio"]),
+        (UIA_ComboBoxControlTypeId, &["combobox"]),
+        (UIA_MenuItemControlTypeId, &["menuitem"]),
+        (UIA_TabItemControlTypeId, &["tab"]),
+    ];
+    m.iter().find(|(c, _)| *c == ct).map(|(_, r)| *r).unwrap_or(&[])
+}
+
 fn check_of(el: &IUIAutomationElement) -> Option<Check> {
     if let Some(t) = current(el, UIA_ToggleToggleStatePropertyId).and_then(|v| v.i32()) {
         return Some(Check::Toggle(el.clone(), t));
